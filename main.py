@@ -4,8 +4,8 @@ import select
 import time
 
 SOCKS5_VERSION = 5
-username = "bot"
-password = "bot"
+username = "1"
+password = "1"
 blocked_packets = set()
 block_lock = threading.Lock()
 
@@ -168,4 +168,4 @@ def run(host, port):
             pass
 
 if __name__ == "__main__":
-    run("127.0.0.1", 6700)
+    run("127.0.0.1", 3000)
