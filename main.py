@@ -4,8 +4,8 @@ import select
 import time
 
 SOCKS5_VERSION = 5
-username = "1"
-password = "1"
+username = "your_username"
+password = "your_password"
 blocked_packets = set()
 block_lock = threading.Lock()
 
