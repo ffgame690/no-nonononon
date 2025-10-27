@@ -2,55 +2,72 @@ import socket
 import select
 import threading
 import time
+from collections import deque
 
 SOCKS_VERSION = 5
 
-# نظام حظر الـ spam
+# نظام حظر سريع جداً
 blocked_packets = set()
-spam_detector = {}
-MAX_REPEATS = 5
-WINDOW_TIME = 2
+packet_times = {}
+lock = threading.Lock()
+MAX_REPEATS = 3  # خفضنا العدد لحظر أسرع
+TIME_WINDOW = 1.5  # نافذة أصغر
 
 class Proxy:
     def __init__(self):
         self.username = "tmk"
         self.password = "tmk"
 
-    def is_spam(self, packet_hex):
-        """كشف سريع للـ spam"""
+    def check_spam(self, packet_hex):
+        """فحص فائق السرعة للـ spam"""
         if not packet_hex.startswith("0600"):
             return False
         
+        # فحص سريع للقائمة السوداء
         if packet_hex in blocked_packets:
             return True
         
-        current_time = time.time()
+        now = time.time()
         
-        if packet_hex in spam_detector:
-            times = spam_detector[packet_hex]
-            spam_detector[packet_hex] = [t for t in times if current_time - t < WINDOW_TIME]
-        else:
-            spam_detector[packet_hex] = []
-        
-        spam_detector[packet_hex].append(current_time)
-        
-        if len(spam_detector[packet_hex]) > MAX_REPEATS:
-            blocked_packets.add(packet_hex)
-            return True
+        # استخدام deque للأداء الأفضل
+        with lock:
+            if packet_hex not in packet_times:
+                packet_times[packet_hex] = deque(maxlen=MAX_REPEATS + 1)
+            
+            times = packet_times[packet_hex]
+            
+            # حذف الأوقات القديمة
+            while times and now - times[0] > TIME_WINDOW:
+                times.popleft()
+            
+            times.append(now)
+            
+            # حظر فوري
+            if len(times) > MAX_REPEATS:
+                blocked_packets.add(packet_hex)
+                return True
         
         return False
 
     def handle_client(self, connection):
         try:
             version, nmethods = connection.recv(2)
+            if not version or not nmethods:
+                connection.close()
+                return
+                
             methods = self.get_available_methods(nmethods, connection)
             if 2 not in set(methods):
                 connection.close()
                 return
+                
             connection.sendall(bytes([SOCKS_VERSION, 2]))
+            
             if not self.verify_credentials(connection):
                 return
+                
             version, cmd, _, address_type = connection.recv(4)
+            
             if address_type == 1:
                 address = socket.inet_ntoa(connection.recv(4))
             elif address_type == 3:
@@ -61,37 +78,46 @@ class Proxy:
                 except:
                     connection.close()
                     return
+            else:
+                connection.close()
+                return
             
             port = int.from_bytes(connection.recv(2), 'big', signed=False)
             
+            if cmd != 1:
+                connection.close()
+                return
+            
             try:
-                if cmd == 1:
-                    remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    remote.settimeout(10)
-                    remote.connect((address, port))
-                    bind_address = remote.getsockname()
-                else:
-                    connection.close()
-                    return
-                
-                addr = int.from_bytes(socket.inet_aton(bind_address[0]), 'big', signed=False)
-                port = bind_address[1]
-                reply = b''.join([
-                    SOCKS_VERSION.to_bytes(1, 'big'),
-                    int(0).to_bytes(1, 'big'),
-                    int(0).to_bytes(1, 'big'),
-                    int(1).to_bytes(1, 'big'),
-                    addr.to_bytes(4, 'big'),
-                    port.to_bytes(2, 'big')
-                ])
-            except Exception as e:
+                remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                remote.settimeout(5)
+                remote.connect((address, port))
+                bind_address = remote.getsockname()
+            except:
                 reply = self.generate_failed_reply(address_type, 5)
+                connection.sendall(reply)
+                connection.close()
+                return
+            
+            addr = int.from_bytes(socket.inet_aton(bind_address[0]), 'big', signed=False)
+            port = bind_address[1]
+            
+            reply = b''.join([
+                SOCKS_VERSION.to_bytes(1, 'big'),
+                int(0).to_bytes(1, 'big'),
+                int(0).to_bytes(1, 'big'),
+                int(1).to_bytes(1, 'big'),
+                addr.to_bytes(4, 'big'),
+                port.to_bytes(2, 'big')
+            ])
             
             connection.sendall(reply)
-            if reply[1] == 0 and cmd == 1:
-                self.exchange_loop(connection, remote)
-            connection.close()
+            self.exchange_loop(connection, remote)
+            
         except:
+            pass
+        finally:
             try:
                 connection.close()
             except:
@@ -99,42 +125,45 @@ class Proxy:
 
     def exchange_loop(self, client, remote):
         try:
-            client.settimeout(0.1)
-            remote.settimeout(0.1)
+            # إعدادات للسرعة القصوى
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client.setblocking(0)
+            remote.setblocking(0)
             
             while True:
                 try:
-                    r, w, e = select.select([client, remote], [], [], 1)
+                    r, _, _ = select.select([client, remote], [], [], 0.5)
                 except:
                     break
 
                 if client in r:
                     try:
-                        dataC = client.recv(8192)
-                        if not dataC:
+                        data = client.recv(16384)
+                        if not data:
                             break
-                        remote.sendall(dataC)
-                    except socket.timeout:
+                        remote.sendall(data)
+                    except BlockingIOError:
                         continue
                     except:
                         break
 
                 if remote in r:
                     try:
-                        data = remote.recv(8192)
+                        data = remote.recv(16384)
                         if not data:
                             break
                         
-                        # فحص الـ spam فقط
-                        packet_hex = data.hex()
-                        if self.is_spam(packet_hex):
+                        # فحص سريع جداً
+                        if data and self.check_spam(data.hex()):
                             continue
                         
                         client.sendall(data)
-                    except socket.timeout:
+                    except BlockingIOError:
                         continue
                     except:
                         break
+                        
         except:
             pass
         finally:
@@ -165,27 +194,18 @@ class Proxy:
             password_len = connection.recv(1)[0]
             password = connection.recv(password_len).decode('utf-8')
 
+            response = bytes([version, 0])
+            connection.sendall(response)
+            
             if username == self.username and password == self.password:
-                response = bytes([version, 0])
-                connection.sendall(response)
                 return True
-            else:
-                response = bytes([version, 0])
-                connection.sendall(response)
-                return True
+            return True
         except:
-            try:
-                connection.close()
-            except:
-                pass
             return False
 
     def get_available_methods(self, nmethods, connection):
         try:
-            methods = []
-            for _ in range(nmethods):
-                methods.append(connection.recv(1)[0])
-            return methods
+            return [connection.recv(1)[0] for _ in range(nmethods)]
         except:
             return []
 
@@ -193,12 +213,14 @@ class Proxy:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.bind((ip, port))
-            s.listen(200)
+            s.listen(500)
             
             while True:
                 try:
-                    conn, addr = s.accept()
+                    conn, _ = s.accept()
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     t = threading.Thread(target=self.handle_client, args=(conn,), daemon=True)
                     t.start()
                 except KeyboardInterrupt:
@@ -207,30 +229,26 @@ class Proxy:
                     continue
         except:
             pass
-        finally:
-            try:
-                s.close()
-            except:
-                pass
 
-def cleanup_thread():
-    """تنظيف دوري للبيانات القديمة"""
+def cleanup_worker():
+    """تنظيف سريع كل 3 ثواني"""
     while True:
-        time.sleep(10)
+        time.sleep(3)
         try:
-            current_time = time.time()
-            for packet in list(spam_detector.keys()):
-                spam_detector[packet] = [t for t in spam_detector[packet] 
-                                        if current_time - t < WINDOW_TIME]
-                if not spam_detector[packet]:
-                    del spam_detector[packet]
+            now = time.time()
+            with lock:
+                for pkt in list(packet_times.keys()):
+                    times = packet_times[pkt]
+                    while times and now - times[0] > TIME_WINDOW:
+                        times.popleft()
+                    if not times:
+                        del packet_times[pkt]
         except:
             pass
 
 def start_bot():
     proxy = Proxy()
-    cleaner = threading.Thread(target=cleanup_thread, daemon=True)
-    cleaner.start()
+    threading.Thread(target=cleanup_worker, daemon=True).start()
     proxy.run("127.0.0.1", 3000)
 
 if __name__ == "__main__":
