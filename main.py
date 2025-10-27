@@ -2,247 +2,230 @@ import socket
 import select
 import threading
 import time
-from collections import deque
 
 SOCKS_VERSION = 5
 
-# نظام حظر سريع جداً
-blocked_packets = set()
-packet_times = {}
-lock = threading.Lock()
-MAX_REPEATS = 3  # خفضنا العدد لحظر أسرع
-TIME_WINDOW = 1.5  # نافذة أصغر
+# 🛡️ نظام دفاع متعدد الطبقات
+GLOBAL_BLOCK = set()
+RATE_LIMIT = {}
+LOCK = threading.Lock()
+
+# ⚙️ إعدادات الحماية القصوى
+MAX_PACKETS_PER_SEC = 2
+BLOCK_THRESHOLD = 3
+DETECTION_WINDOW = 0.8
+CLEANUP_INTERVAL = 1.5
 
 class Proxy:
     def __init__(self):
         self.username = "tmk"
         self.password = "tmk"
-
-    def check_spam(self, packet_hex):
-        """فحص فائق السرعة للـ spam"""
-        if not packet_hex.startswith("0600"):
-            return False
-        
-        # فحص سريع للقائمة السوداء
-        if packet_hex in blocked_packets:
+    
+    def detect_attack(self, hex_data):
+        """🔍 كشف ذكي متعدد الطبقات للهجمات"""
+        if hex_data in GLOBAL_BLOCK:
             return True
+        
+        if not hex_data.startswith("0600"):
+            return False
         
         now = time.time()
         
-        # استخدام deque للأداء الأفضل
-        with lock:
-            if packet_hex not in packet_times:
-                packet_times[packet_hex] = deque(maxlen=MAX_REPEATS + 1)
+        with LOCK:
+            if hex_data not in RATE_LIMIT:
+                RATE_LIMIT[hex_data] = []
             
-            times = packet_times[packet_hex]
+            RATE_LIMIT[hex_data] = [
+                t for t in RATE_LIMIT[hex_data] 
+                if now - t < DETECTION_WINDOW
+            ]
             
-            # حذف الأوقات القديمة
-            while times and now - times[0] > TIME_WINDOW:
-                times.popleft()
+            RATE_LIMIT[hex_data].append(now)
+            count = len(RATE_LIMIT[hex_data])
             
-            times.append(now)
-            
-            # حظر فوري
-            if len(times) > MAX_REPEATS:
-                blocked_packets.add(packet_hex)
+            if count > BLOCK_THRESHOLD:
+                GLOBAL_BLOCK.add(hex_data)
+                del RATE_LIMIT[hex_data]
                 return True
+            
+            if count >= MAX_PACKETS_PER_SEC:
+                time_span = now - RATE_LIMIT[hex_data][0]
+                if time_span < 0.5:
+                    GLOBAL_BLOCK.add(hex_data)
+                    del RATE_LIMIT[hex_data]
+                    return True
         
         return False
 
-    def handle_client(self, connection):
+    def handle_client(self, conn):
+        remote = None
         try:
-            version, nmethods = connection.recv(2)
-            if not version or not nmethods:
-                connection.close()
-                return
-                
-            methods = self.get_available_methods(nmethods, connection)
-            if 2 not in set(methods):
-                connection.close()
-                return
-                
-            connection.sendall(bytes([SOCKS_VERSION, 2]))
+            v, n = conn.recv(2)
+            methods = [conn.recv(1)[0] for _ in range(n)]
             
-            if not self.verify_credentials(connection):
-                return
-                
-            version, cmd, _, address_type = connection.recv(4)
-            
-            if address_type == 1:
-                address = socket.inet_ntoa(connection.recv(4))
-            elif address_type == 3:
-                domain_length = connection.recv(1)[0]
-                address = connection.recv(domain_length)
-                try:
-                    address = socket.gethostbyname(address)
-                except:
-                    connection.close()
-                    return
-            else:
-                connection.close()
+            if 2 not in methods:
+                conn.close()
                 return
             
-            port = int.from_bytes(connection.recv(2), 'big', signed=False)
+            conn.sendall(bytes([SOCKS_VERSION, 2]))
+            
+            v = conn.recv(1)[0]
+            ulen = conn.recv(1)[0]
+            user = conn.recv(ulen)
+            plen = conn.recv(1)[0]
+            pwd = conn.recv(plen)
+            
+            conn.sendall(bytes([v, 0]))
+            
+            v, cmd, _, atyp = conn.recv(4)
             
             if cmd != 1:
-                connection.close()
+                conn.close()
                 return
             
-            try:
-                remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                remote.settimeout(5)
-                remote.connect((address, port))
-                bind_address = remote.getsockname()
-            except:
-                reply = self.generate_failed_reply(address_type, 5)
-                connection.sendall(reply)
-                connection.close()
+            if atyp == 1:
+                addr = socket.inet_ntoa(conn.recv(4))
+            elif atyp == 3:
+                dlen = conn.recv(1)[0]
+                addr = socket.gethostbyname(conn.recv(dlen))
+            else:
+                conn.close()
                 return
             
-            addr = int.from_bytes(socket.inet_aton(bind_address[0]), 'big', signed=False)
-            port = bind_address[1]
+            port = int.from_bytes(conn.recv(2), 'big')
             
-            reply = b''.join([
-                SOCKS_VERSION.to_bytes(1, 'big'),
-                int(0).to_bytes(1, 'big'),
-                int(0).to_bytes(1, 'big'),
-                int(1).to_bytes(1, 'big'),
-                addr.to_bytes(4, 'big'),
-                port.to_bytes(2, 'big')
-            ])
+            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            remote.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            remote.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            remote.settimeout(3)
+            remote.connect((addr, port))
             
-            connection.sendall(reply)
-            self.exchange_loop(connection, remote)
+            ba = remote.getsockname()
+            reply = (
+                SOCKS_VERSION.to_bytes(1, 'big') +
+                b'\x00\x00\x01' +
+                socket.inet_aton(ba[0]) +
+                ba[1].to_bytes(2, 'big')
+            )
+            conn.sendall(reply)
+            
+            self.protected_exchange(conn, remote)
             
         except:
             pass
         finally:
             try:
-                connection.close()
+                conn.close()
+            except:
+                pass
+            try:
+                if remote:
+                    remote.close()
             except:
                 pass
 
-    def exchange_loop(self, client, remote):
+    def protected_exchange(self, client, remote):
+        """🛡️ نقل بيانات محمي بالكامل"""
         try:
-            # إعدادات للسرعة القصوى
-            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             client.setblocking(0)
             remote.setblocking(0)
             
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            
+            blocked_count = 0
+            
             while True:
                 try:
-                    r, _, _ = select.select([client, remote], [], [], 0.5)
+                    r, _, _ = select.select([client, remote], [], [], 0.2)
                 except:
                     break
-
+                
                 if client in r:
                     try:
-                        data = client.recv(16384)
+                        data = client.recv(32768)
                         if not data:
                             break
                         remote.sendall(data)
                     except BlockingIOError:
-                        continue
+                        pass
                     except:
                         break
-
+                
                 if remote in r:
                     try:
-                        data = remote.recv(16384)
+                        data = remote.recv(32768)
                         if not data:
                             break
                         
-                        # فحص سريع جداً
-                        if data and self.check_spam(data.hex()):
+                        if self.detect_attack(data.hex()):
+                            blocked_count += 1
+                            if blocked_count > 50:
+                                break
                             continue
                         
                         client.sendall(data)
+                        
                     except BlockingIOError:
-                        continue
+                        pass
                     except:
                         break
                         
         except:
             pass
-        finally:
-            try:
-                client.close()
-            except:
-                pass
-            try:
-                remote.close()
-            except:
-                pass
 
-    def generate_failed_reply(self, address_type, error_number):
-        return b''.join([
-            SOCKS_VERSION.to_bytes(1, 'big'),
-            error_number.to_bytes(1, 'big'),
-            int(0).to_bytes(1, 'big'),
-            address_type.to_bytes(1, 'big'),
-            int(0).to_bytes(4, 'big'),
-            int(0).to_bytes(4, 'big')
-        ])
-
-    def verify_credentials(self, connection):
+    def run(self, host, port):
         try:
-            version = connection.recv(1)[0]
-            username_len = connection.recv(1)[0]
-            username = connection.recv(username_len).decode('utf-8')
-            password_len = connection.recv(1)[0]
-            password = connection.recv(password_len).decode('utf-8')
-
-            response = bytes([version, 0])
-            connection.sendall(response)
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
-            if username == self.username and password == self.password:
-                return True
-            return True
-        except:
-            return False
-
-    def get_available_methods(self, nmethods, connection):
-        try:
-            return [connection.recv(1)[0] for _ in range(nmethods)]
-        except:
-            return []
-
-    def run(self, ip, port):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.bind((ip, port))
-            s.listen(500)
+            try:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except:
+                pass
+            
+            srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            srv.bind((host, port))
+            srv.listen(2000)
             
             while True:
                 try:
-                    conn, _ = s.accept()
+                    conn, _ = srv.accept()
                     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    t = threading.Thread(target=self.handle_client, args=(conn,), daemon=True)
-                    t.start()
+                    threading.Thread(
+                        target=self.handle_client, 
+                        args=(conn,), 
+                        daemon=True
+                    ).start()
                 except KeyboardInterrupt:
                     break
                 except:
-                    continue
+                    pass
         except:
             pass
 
 def cleanup_worker():
-    """تنظيف سريع كل 3 ثواني"""
+    """🧹 تنظيف عدواني للذاكرة"""
     while True:
-        time.sleep(3)
+        time.sleep(CLEANUP_INTERVAL)
         try:
             now = time.time()
-            with lock:
-                for pkt in list(packet_times.keys()):
-                    times = packet_times[pkt]
-                    while times and now - times[0] > TIME_WINDOW:
-                        times.popleft()
-                    if not times:
-                        del packet_times[pkt]
+            with LOCK:
+                for pkt in list(RATE_LIMIT.keys()):
+                    RATE_LIMIT[pkt] = [
+                        t for t in RATE_LIMIT[pkt] 
+                        if now - t < DETECTION_WINDOW
+                    ]
+                    if not RATE_LIMIT[pkt]:
+                        del RATE_LIMIT[pkt]
+                
+                if len(GLOBAL_BLOCK) > 1000:
+                    items = list(GLOBAL_BLOCK)
+                    GLOBAL_BLOCK.clear()
+                    GLOBAL_BLOCK.update(items[-800:])
+                    
         except:
             pass
 
