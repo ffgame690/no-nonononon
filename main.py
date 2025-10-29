@@ -6,7 +6,7 @@ import struct
 SOCKS_USERNAME = "tmk"
 SOCKS_PASSWORD = "tmk"
 PROXY_HOST = "127.0.0.1"
-PROXY_PORT = 6700
+PROXY_PORT = 3000
 
 # إعدادات الفلتر
 GAME_SERVER_PORT = 39699
