@@ -35,12 +35,17 @@ class SOCKSProxy:
     def __init__(self):
         self.filter = PacketFilter()
         self.server_socket = None
+        self.host = None
+        self.port = None
     
-    def start(self):
+    def run(self, host, port):
         """بدء الـ SOCKS proxy server"""
+        self.host = host
+        self.port = port
+        
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((PROXY_HOST, PROXY_PORT))
+        self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(5)
         
         try:
@@ -183,7 +188,7 @@ class SOCKSProxy:
 def start_bot():
     """الدالة الرئيسية لبدء البوت"""
     proxy = SOCKSProxy()
-    proxy.start()
+    proxy.run("127.0.0.1", 3000)
 
 if __name__ == "__main__":
     start_bot()
