@@ -1,238 +1,189 @@
 import socket
-import select
 import threading
-import time
+import struct
 
-SOCKS_VERSION = 5
+# إعدادات SOCKS Proxy
+SOCKS_USERNAME = "tmk"
+SOCKS_PASSWORD = "tmk"
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 6700
 
-# 🛡️ نظام دفاع متعدد الطبقات
-GLOBAL_BLOCK = set()
-RATE_LIMIT = {}
-LOCK = threading.Lock()
+# إعدادات الفلتر
+GAME_SERVER_PORT = 39699
+BLOCKED_PACKET_PREFIX = b'\x06\x00'  # 0600 في hex
 
-# ⚙️ إعدادات الحماية القصوى
-MAX_PACKETS_PER_SEC = 2
-BLOCK_THRESHOLD = 3
-DETECTION_WINDOW = 0.8
-CLEANUP_INTERVAL = 1.5
-
-class Proxy:
+class PacketFilter:
     def __init__(self):
-        self.username = "tmk"
-        self.password = "tmk"
+        self.blocked_count = 0
+        self.total_packets = 0
     
-    def detect_attack(self, hex_data):
-        """🔍 كشف ذكي متعدد الطبقات للهجمات"""
-        if hex_data in GLOBAL_BLOCK:
-            return True
-        
-        if not hex_data.startswith("0600"):
+    def should_block_packet(self, data, src_port):
+        """فحص إذا كان يجب حظر الـ packet"""
+        if not data or len(data) < 2:
             return False
         
-        now = time.time()
-        
-        with LOCK:
-            if hex_data not in RATE_LIMIT:
-                RATE_LIMIT[hex_data] = []
-            
-            RATE_LIMIT[hex_data] = [
-                t for t in RATE_LIMIT[hex_data] 
-                if now - t < DETECTION_WINDOW
-            ]
-            
-            RATE_LIMIT[hex_data].append(now)
-            count = len(RATE_LIMIT[hex_data])
-            
-            if count > BLOCK_THRESHOLD:
-                GLOBAL_BLOCK.add(hex_data)
-                del RATE_LIMIT[hex_data]
+        # فحص إذا كان الـ packet من port السرفر
+        if src_port == GAME_SERVER_PORT:
+            # فحص إذا كان الـ packet يبدأ بـ 0600
+            if data[:2] == BLOCKED_PACKET_PREFIX:
+                self.blocked_count += 1
                 return True
-            
-            if count >= MAX_PACKETS_PER_SEC:
-                time_span = now - RATE_LIMIT[hex_data][0]
-                if time_span < 0.5:
-                    GLOBAL_BLOCK.add(hex_data)
-                    del RATE_LIMIT[hex_data]
-                    return True
         
         return False
 
-    def handle_client(self, conn):
-        remote = None
+class SOCKSProxy:
+    def __init__(self):
+        self.filter = PacketFilter()
+        self.server_socket = None
+    
+    def start(self):
+        """بدء الـ SOCKS proxy server"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((PROXY_HOST, PROXY_PORT))
+        self.server_socket.listen(5)
+        
         try:
-            v, n = conn.recv(2)
-            methods = [conn.recv(1)[0] for _ in range(n)]
-            
-            if 2 not in methods:
-                conn.close()
+            while True:
+                client_socket, addr = self.server_socket.accept()
+                
+                client_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket,)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+        except KeyboardInterrupt:
+            self.stop()
+    
+    def handle_client(self, client_socket):
+        """معالجة اتصال العميل"""
+        try:
+            # استقبال SOCKS handshake
+            version = client_socket.recv(1)
+            if version != b'\x05':
+                client_socket.close()
                 return
             
-            conn.sendall(bytes([SOCKS_VERSION, 2]))
+            # معالجة authentication methods
+            nmethods = ord(client_socket.recv(1))
+            methods = client_socket.recv(nmethods)
             
-            v = conn.recv(1)[0]
-            ulen = conn.recv(1)[0]
-            user = conn.recv(ulen)
-            plen = conn.recv(1)[0]
-            pwd = conn.recv(plen)
+            # طلب username/password authentication
+            client_socket.sendall(b'\x05\x02')
             
-            conn.sendall(bytes([v, 0]))
-            
-            v, cmd, _, atyp = conn.recv(4)
-            
-            if cmd != 1:
-                conn.close()
+            # التحقق من credentials
+            if not self.authenticate(client_socket):
+                client_socket.close()
                 return
             
-            if atyp == 1:
-                addr = socket.inet_ntoa(conn.recv(4))
-            elif atyp == 3:
-                dlen = conn.recv(1)[0]
-                addr = socket.gethostbyname(conn.recv(dlen))
+            # استقبال الطلب
+            version, cmd, _, atyp = struct.unpack('!BBBB', client_socket.recv(4))
+            
+            if cmd != 1:  # CONNECT command
+                client_socket.close()
+                return
+            
+            # الحصول على العنوان والـ port
+            if atyp == 1:  # IPv4
+                addr = socket.inet_ntoa(client_socket.recv(4))
+            elif atyp == 3:  # Domain name
+                addr_len = ord(client_socket.recv(1))
+                addr = client_socket.recv(addr_len).decode()
             else:
-                conn.close()
+                client_socket.close()
                 return
             
-            port = int.from_bytes(conn.recv(2), 'big')
+            port = struct.unpack('!H', client_socket.recv(2))[0]
             
-            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            remote.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            remote.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-            remote.settimeout(3)
-            remote.connect((addr, port))
-            
-            ba = remote.getsockname()
-            reply = (
-                SOCKS_VERSION.to_bytes(1, 'big') +
-                b'\x00\x00\x01' +
-                socket.inet_aton(ba[0]) +
-                ba[1].to_bytes(2, 'big')
-            )
-            conn.sendall(reply)
-            
-            self.protected_exchange(conn, remote)
-            
+            # الاتصال بالسرفر المستهدف
+            remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                remote_socket.connect((addr, port))
+                
+                # إرسال رد نجاح
+                reply = b'\x05\x00\x00\x01' + socket.inet_aton('0.0.0.0') + struct.pack('!H', 0)
+                client_socket.sendall(reply)
+                
+                # بدء تمرير البيانات مع الفلترة
+                self.relay_data(client_socket, remote_socket, port)
+                
+            except:
+                reply = b'\x05\x05\x00\x01' + socket.inet_aton('0.0.0.0') + struct.pack('!H', 0)
+                client_socket.sendall(reply)
+            finally:
+                remote_socket.close()
+                
         except:
             pass
         finally:
+            client_socket.close()
+    
+    def authenticate(self, client_socket):
+        """التحقق من username و password"""
+        version = client_socket.recv(1)
+        username_len = ord(client_socket.recv(1))
+        username = client_socket.recv(username_len).decode()
+        password_len = ord(client_socket.recv(1))
+        password = client_socket.recv(password_len).decode()
+        
+        if username == SOCKS_USERNAME and password == SOCKS_PASSWORD:
+            client_socket.sendall(b'\x01\x00')
+            return True
+        else:
+            client_socket.sendall(b'\x01\x01')
+            return False
+    
+    def relay_data(self, client_socket, remote_socket, remote_port):
+        """تمرير البيانات بين العميل والسرفر مع الفلترة"""
+        
+        def forward(src, dst, is_from_server=False):
             try:
-                conn.close()
-            except:
-                pass
-            try:
-                if remote:
-                    remote.close()
-            except:
-                pass
-
-    def protected_exchange(self, client, remote):
-        """🛡️ نقل بيانات محمي بالكامل"""
-        try:
-            client.setblocking(0)
-            remote.setblocking(0)
-            
-            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-            
-            blocked_count = 0
-            
-            while True:
-                try:
-                    r, _, _ = select.select([client, remote], [], [], 0.2)
-                except:
-                    break
-                
-                if client in r:
-                    try:
-                        data = client.recv(32768)
-                        if not data:
-                            break
-                        remote.sendall(data)
-                    except BlockingIOError:
-                        pass
-                    except:
+                while True:
+                    data = src.recv(4096)
+                    if not data:
                         break
-                
-                if remote in r:
-                    try:
-                        data = remote.recv(32768)
-                        if not data:
-                            break
-                        
-                        if self.detect_attack(data.hex()):
-                            blocked_count += 1
-                            if blocked_count > 50:
-                                break
-                            continue
-                        
-                        client.sendall(data)
-                        
-                    except BlockingIOError:
-                        pass
-                    except:
-                        break
-                        
-        except:
-            pass
-
-    def run(self, host, port):
-        try:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
-            try:
-                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except:
-                pass
-            
-            srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            srv.bind((host, port))
-            srv.listen(2000)
-            
-            while True:
-                try:
-                    conn, _ = srv.accept()
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    threading.Thread(
-                        target=self.handle_client, 
-                        args=(conn,), 
-                        daemon=True
-                    ).start()
-                except KeyboardInterrupt:
-                    break
-                except:
-                    pass
-        except:
-            pass
-
-def cleanup_worker():
-    """🧹 تنظيف عدواني للذاكرة"""
-    while True:
-        time.sleep(CLEANUP_INTERVAL)
-        try:
-            now = time.time()
-            with LOCK:
-                for pkt in list(RATE_LIMIT.keys()):
-                    RATE_LIMIT[pkt] = [
-                        t for t in RATE_LIMIT[pkt] 
-                        if now - t < DETECTION_WINDOW
-                    ]
-                    if not RATE_LIMIT[pkt]:
-                        del RATE_LIMIT[pkt]
-                
-                if len(GLOBAL_BLOCK) > 1000:
-                    items = list(GLOBAL_BLOCK)
-                    GLOBAL_BLOCK.clear()
-                    GLOBAL_BLOCK.update(items[-800:])
                     
-        except:
-            pass
+                    self.filter.total_packets += 1
+                    
+                    # فلترة البيانات القادمة من السرفر
+                    if is_from_server:
+                        if self.filter.should_block_packet(data, remote_port):
+                            # حظر الـ packet ولا نرسله للعميل
+                            continue
+                    
+                    dst.sendall(data)
+            except:
+                pass
+        
+        # إنشاء threads للتمرير في الاتجاهين
+        client_to_server = threading.Thread(
+            target=forward,
+            args=(client_socket, remote_socket, False)
+        )
+        server_to_client = threading.Thread(
+            target=forward,
+            args=(remote_socket, client_socket, True)
+        )
+        
+        client_to_server.daemon = True
+        server_to_client.daemon = True
+        
+        client_to_server.start()
+        server_to_client.start()
+        
+        client_to_server.join()
+        server_to_client.join()
+    
+    def stop(self):
+        """إيقاف الـ proxy"""
+        if self.server_socket:
+            self.server_socket.close()
 
 def start_bot():
-    proxy = Proxy()
-    threading.Thread(target=cleanup_worker, daemon=True).start()
-    proxy.run("127.0.0.1", 3000)
+    """الدالة الرئيسية لبدء البوت"""
+    proxy = SOCKSProxy()
+    proxy.start()
 
 if __name__ == "__main__":
     start_bot()
